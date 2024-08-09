@@ -1,0 +1,309 @@
+---
+title: "JHU COVID-19 Data"
+author: "K. Katzmann"
+date: "2024-08-05"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+## Introduction
+
+This analysis aims to identify trends in new COVID-19 cases and deaths over time, and to better understand how the ratio of deaths to confirmed cases changes over time.
+Is there evidence, based on the ratio of confirmed cases to deaths over time, that treatments have improved throughout the pandemic?
+
+To answer this question, we will explore COVID-19 datasets from the [Johns Hopkins University COVID-19 data repository](https://github.com/CSSEGISandData/COVID-19).
+These datasets contain information on the number of confirmed COVID-19 cases and deaths at both the US and global levels from January 2020 to March 2023.
+
+## Importing Data
+
+We'll begin the analysis by installing necessary packages and importing data from the Johns Hopkins University COVID-19 data repository.
+```{r setup, results='hide', message=FALSE}
+# load necessary libraries
+library(tidyverse)
+library(lubridate)
+
+# set theme for ggplot
+theme_set(theme_minimal())
+```
+
+We'll import the datasets for US confirmed cases, US deaths, global confirmed cases and global deaths.
+```{r import_data, results='hide', message=FALSE}
+covid_start <- "2020-01-01"
+
+base_url <- "https://raw.githubusercontent.com/CSSEGISandData/COVID-19/master/csse_covid_19_data/csse_covid_19_time_series/"
+
+file_names <- c(
+  "time_series_covid19_confirmed_US.csv",
+  "time_series_covid19_deaths_US.csv",
+  "time_series_covid19_confirmed_global.csv",
+  "time_series_covid19_deaths_global.csv"
+)
+
+confirmed_us_raw <- read_csv(paste0(base_url, file_names[1]))
+deaths_us_raw <- read_csv(paste0(base_url, file_names[2]))
+confirmed_global_raw <- read_csv(paste0(base_url, file_names[3]))
+deaths_global_raw <- read_csv(paste0(base_url, file_names[4]))
+```
+
+Next, let's inspect the data to understand its structure and contents.
+```{r inspect_data}
+
+confirmed_us_raw
+
+deaths_us_raw
+
+confirmed_global_raw
+
+deaths_global_raw
+```
+
+## Tidying and Transforming Data
+
+After inspecting the data, we see that there is one row per location and columns for each date with the number of confirmed cases and deaths on that date.
+We also see that the number is cumulative, so we will need to calculate the new cases and deaths per day.
+From there, we will calculate the ratio of deaths to confirmed cases to see if there are any trends over time.
+
+We'll start with the US confirmed cases and deaths datasets.
+We'll begin tidying by removing unassigned locations and columns that are not needed for our analysis.
+Then we'll pivot the date columns to rows and calculate new cases and deaths per day.
+Finally, we'll join the two datasets together and calculate the ratio of deaths to confirmed cases.
+```{r tidy_us_data}
+# tidy US data
+confirmed_us <- confirmed_us_raw %>%
+  # remove unneeded columns
+  select(-c(iso2, iso3, code3, FIPS, Lat, Long_, Combined_Key)) %>%
+  # filter out bad or unneeded data
+  filter(Admin2 != 'Unassigned',
+         Country_Region == 'US') %>%
+  # pivot date columns to rows
+  pivot_longer(cols = -c(UID, Admin2, Province_State, Country_Region),
+               names_to = "Date", values_to = "Confirmed") %>%
+  # convert data types
+  mutate(Date = mdy(Date)) %>%
+  # calculate new cases per day
+  arrange(UID, Date) %>%
+  mutate(Lag_Confirmed = lag(Confirmed),
+         # we need to lag the UID as well so that we don't compare cases between different places!
+         Lag_UID = lag(UID),
+         New_Confirmed = case_when(
+             UID == Lag_UID ~ (Confirmed - Lag_Confirmed),
+             TRUE ~ NA
+         ))
+
+deaths_us <- deaths_us_raw %>%
+  # remove unneeded columns
+  select(-c(iso2, iso3, code3, FIPS, Lat, Long_, Combined_Key)) %>%
+  # filter out bad or unneeded data
+  filter(Admin2 != 'Unassigned',
+         Country_Region == 'US') %>%
+  # pivot date columns to rows
+  pivot_longer(cols = -c(UID, Admin2, Province_State, Country_Region, Population),
+              names_to = "Date", values_to = "Deaths") %>%
+  # convert data types
+  mutate(Date = mdy(Date)) %>%
+  # calculate new deaths per day
+  arrange(UID, Date) %>%
+  mutate(Lag_Deaths = lag(Deaths),
+         # we need to lag the UID as well so that we don't compare cases between different places!
+         Lag_UID = lag(UID),
+         New_Deaths = case_when(
+             UID == Lag_UID ~ (Deaths - Lag_Deaths),
+             TRUE ~ NA
+         ))
+
+all_us <- confirmed_us %>%
+  # join deaths data. We only need a few columns
+  left_join(deaths_us %>%
+              select(UID, Date, Deaths, New_Deaths),
+            by = c("UID", "Date")) %>%
+  # add a couple of columns for analysis
+  mutate(Month_Year = format(Date, '%Y-%m'),
+         Months_Since_Start = interval(covid_start, Date) %/% months(1)) %>%
+  # aggregating to reduce variance in ratios
+  group_by(Country_Region, Province_State, Month_Year, Months_Since_Start) %>%
+  summarise(New_Deaths = sum(New_Deaths),
+            New_Confirmed = sum(New_Confirmed)) %>%
+  # calculate ratio of deaths to confirmed cases
+  mutate(Deaths_to_Cases_Ratio = ifelse(New_Confirmed == 0, NA, (New_Deaths * 1000 / New_Confirmed))) %>%
+  # cases less than 100 can affect ratio too much
+  filter(New_Confirmed >= 100)
+
+all_us
+```
+
+Now we'll repeat the same process for the global datasets.
+We'll remove rows and columns that we won't need for our analysis, then we'll pivot the date columns to rows and calculate new cases and deaths per day.
+Finally, we'll join the two datasets together and calculate the ratio of deaths to confirmed cases.
+```{r tidy_global_data}
+# tidy global data
+confirmed_global <- confirmed_global_raw %>%
+  # rename columns
+  rename(Province_State = `Province/State`, Country_Region = `Country/Region`) %>%
+  # filter out bad or unneeded data
+  filter(!Country_Region %in% c("Korea, North", "Antarctica")) %>%
+  # pivot date columns to rows
+  pivot_longer(cols = -c(Province_State, Country_Region, Lat, Long),
+               names_to = "Date", values_to = "Confirmed") %>%
+  # convert data types and create an ID column to use later on
+  mutate(Date = mdy(Date),
+         Global_ID = paste(Country_Region, Province_State, sep = "|")) %>%
+  # calculate new cases per day
+  arrange(Global_ID, Date) %>%
+  mutate(Lag_Confirmed = lag(Confirmed),
+         # we need to lag the Global_ID as well so that we don't compare cases between different places!
+         Lag_Global_ID = lag(Global_ID),
+         New_Confirmed = case_when(
+           Global_ID == Lag_Global_ID ~ (Confirmed - Lag_Confirmed),
+           TRUE ~ NA
+         ))
+
+deaths_global <- deaths_global_raw %>%
+  # rename columns
+  rename(Province_State = `Province/State`, Country_Region = `Country/Region`) %>%
+  # filter out bad or unneeded data
+  filter(!Country_Region %in% c("Korea, North", "Antarctica")) %>%
+  # pivot date columns to rows
+  pivot_longer(cols = -c(Province_State, Country_Region, Lat, Long),
+               names_to = "Date", values_to = "Deaths") %>%
+  # convert data types and create an ID column to use later on
+  mutate(Date = mdy(Date),
+         Global_ID = paste(Country_Region, Province_State, sep = "|")) %>%
+  # calculate new deaths per day
+  arrange(Global_ID, Date) %>%
+  mutate(Lag_Deaths = lag(Deaths),
+         # we need to lag the UID as well so that we don't compare cases between different places!
+         Lag_Global_ID = lag(Global_ID),
+         New_Deaths = case_when(
+           Global_ID == Lag_Global_ID ~ (Deaths - Lag_Deaths),
+           TRUE ~ NA
+         ))
+
+all_global <- confirmed_global %>%
+  # join deaths data. We only need a few columns
+  left_join(deaths_global %>%
+              select(Global_ID, Date, Deaths, New_Deaths),
+            by = c("Global_ID", "Date")) %>%
+  # add a couple of columns for analysis
+  mutate(Month_Year = format(Date, '%Y-%m'),
+         Months_Since_Start = interval(covid_start, Date) %/% months(1)) %>%
+  # aggregating to reduce variance in ratios
+  group_by(Country_Region, Month_Year, Months_Since_Start) %>%
+  summarise(New_Deaths = sum(New_Deaths),
+            New_Confirmed = sum(New_Confirmed)) %>%
+  # calculate ratio of deaths to confirmed cases
+  mutate(Deaths_to_Cases_Ratio = ifelse(New_Confirmed == 0, NA, (New_Deaths * 1000/ New_Confirmed))) %>%
+  # cases less than 100 can affect ratio too much
+  filter(New_Confirmed >= 100)
+
+all_global
+```
+
+## Exploratory Data Analysis
+
+### US Analysis
+
+We'll start our exploratory data analysis with the US data to see whether there is any evidence of improvements in the ratio of deaths to confirmed cases over time.
+
+First, let's plot the total number of new cases over time.
+```{r plot_us_new_cases}
+all_us %>%
+  group_by(Month_Year) %>%
+  summarise(Mean_New_Confirmed = mean(New_Confirmed),
+            Sum_New_Confirmed = sum(New_Confirmed)) %>%
+  ggplot(aes(x = Month_Year, y = Sum_New_Confirmed)) +
+  geom_col() +
+  theme(axis.text.x = element_text(angle = 45)) +
+  labs(title = "New COVID-19 Cases Over Time",
+       x = "Month",
+       y = "New Cases")
+```
+
+Next, let's plot the ratio of deaths to confirmed cases over time.
+```{r plot_us_deaths_per_1000}
+all_us %>%
+  group_by(Month_Year) %>%
+  summarise(Ratio = sum(New_Deaths) * 1000 / sum(New_Confirmed)) %>%
+  ggplot(aes(x = Month_Year, y = Ratio)) +
+  geom_col() +
+  theme(axis.text.x = element_text(angle = 45)) +
+  labs(title = "Ratio of COVID-19 Deaths to Cases Over Time",
+       x = "Month",
+       y = "Deaths per 1000 Cases")
+```
+
+Finally, let's fit a linear regression model to the US data to see if there is any evidence of improvements in the ratio of deaths to confirmed cases over time.
+We'll try to predict the ratio of deaths to cases based on the number of months since the start of the pandemic and the number of new confirmed cases.
+```{r us_model}
+model <- lm(Deaths_to_Cases_Ratio ~ Months_Since_Start + New_Confirmed, data = all_us)
+summary(model)
+```
+
+### Global Analysis
+Next, we'll repeat the same analysis for the global data to see if there are any trends in the ratio of deaths to confirmed cases over time.
+
+Again, we'll start by plotting the total number of new cases over time.
+```{r plot_global_new_cases}
+all_global %>%
+  group_by(Month_Year) %>%
+  summarise(Mean_New_Confirmed = mean(New_Confirmed),
+            Sum_New_Confirmed = sum(New_Confirmed)) %>%
+  ggplot(aes(x = Month_Year, y = Sum_New_Confirmed)) +
+  geom_col() +
+  theme(axis.text.x = element_text(angle = 45)) +
+  labs(title = "New COVID-19 Cases Over Time",
+       x = "Month",
+       y = "New Cases")
+```
+
+Next, let's plot the ratio of deaths to confirmed cases over time.
+```{r plot_global_deaths_per_1000}
+all_global %>%
+  group_by(Month_Year) %>%
+  summarise(Ratio = sum(New_Deaths) * 1000 / sum(New_Confirmed)) %>%
+  ggplot(aes(x = Month_Year, y = Ratio)) +
+  geom_col() +
+  theme(axis.text.x = element_text(angle = 45)) +
+  labs(title = "Ratio of COVID-19 Deaths to Cases Over Time",
+       x = "Month",
+       y = "Deaths per 1000 Cases")
+```
+
+Finally, let's fit a linear regression model to the global data to see if there is any evidence of improvements in the ratio of deaths to confirmed cases over time.
+As we did with the US data, we'll try to predict the ratio of deaths to cases based on the number of months since the start of the pandemic and the number of new confirmed cases.
+```{r global_model}
+model <- lm(Deaths_to_Cases_Ratio ~ Months_Since_Start + New_Confirmed, data = all_global)
+summary(model)
+```
+
+## Bias and Limitations
+Before discussing the results, it's important to acknowledge the potential biases and limitations of this analysis.
+
+One limitation is that the data is prone to reporitng bias and it may not be complete or accurate.
+For instance, early on in the pandemic, testing capacity was limited, which may have led to underreporting of cases, which would increase the ratio of deaths to confirmed cases at that time.
+
+Another limitation is that the data may not be consistent across states and countries; Reporting practices may vary, which could affect the accuracy of the data and bias our results.
+
+Finally, the analysis assumes that the ratio of deaths to confirmed cases is a good indicator of treatment effectiveness, but there are many other factors that could influence this ratio, include the presence of new variants and the overall health of the population.
+
+## Conclusion
+After analyzing the US and global COVID-19 data, we uncovered a few interesting insights.
+
+In the US and in the global data, the number of new COVID-19 cases fluctuated over time.
+These fluctuations could be caused by outbreaks in different regions and of different variants.
+The total number of new cases could also be affected by the availability of testing.
+
+We also found that the ratio of deaths to confirmed cases decreased over time in both the US and global data.
+We found a negative relationship between the ratio of deaths to confirmed cases and the number of months since the start of the pandemic in the US data (estimate = -0.50, p < 0.001) as well as in the global data (estimate = -0.64, p < 0.001).
+This trend suggests that treatments may have improved over time, leading to a lower mortality rate among confirmed cases.
+
+However, as mentioned in the previous section, it is important to note that the ratio of deaths to confirmed cases is not the only indicator of treatment effectiveness.
+There are likely many other factors that affect the ratio of deaths to confirmed cases.
+
+Overall, this analysis provides some evidence that treatments for COVID-19 may have improved over time.
+Future analyses could explore other factors that may influence the ratio of deaths to confirmed cases, such as the availability of testing and the presence of new variants.
+
+## Session Info
+```{r session_info}
+sessionInfo()
+```
