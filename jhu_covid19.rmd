@@ -3,8 +3,8 @@ title: "JHU COVID-19 Data"
 author: "K. Katzmann"
 date: "2024-08-05"
 output:
-  pdf_document: default
   html_document: default
+  pdf_document: default
 ---
 
 ## Introduction
